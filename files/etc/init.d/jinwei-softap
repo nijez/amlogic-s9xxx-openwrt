@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# 金维 SoftAP 周期调和：开机后定期 reconcile（未 enroll 开热点）
+# 金维 SoftAP 周期调和：开机后每 60s reconcile（有上行关；断网开）
 START=99
 STOP=10
 USE_PROCD=1

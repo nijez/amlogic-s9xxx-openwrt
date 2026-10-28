@@ -19,6 +19,7 @@
     .val { font-size: .92rem; text-align:right; word-break: break-all; }
     .hint { background:#1e2a1e; border:1px solid #2f4a2f; color:var(--ok); border-radius:10px; padding:12px; font-size:.9rem; line-height:1.45; margin-bottom:12px; }
     .warnbox { background:#2a2210; border:1px solid #5a4418; color:var(--warn); border-radius:10px; padding:12px; font-size:.9rem; line-height:1.45; margin-bottom:12px; }
+    .infobox { background:#152033; border:1px solid #2a4060; color:var(--acc); border-radius:10px; padding:12px; font-size:.88rem; line-height:1.45; margin-top:8px; }
     .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background: var(--muted); }
     .dot.ok { background: var(--ok); }
     .dot.warn { background: var(--warn); }
@@ -31,7 +32,7 @@
 <body>
   <main>
     <h1>金维组网 · 本机初始化</h1>
-    <p class="sub">手机已连本机热点。有线是业务主路径；热点只用于初始化／急救。</p>
+    <p class="sub">手机已连本机热点。本页只看本机状态、引导插网线；绑定由插网线后自动完成，无需在本页点「绑定」。</p>
 
     <div class="hint" id="cable_hint">请将网线插入盒子 LAN，接到客户交换机／主路由 LAN（旁路由，本机不开 DHCP）。</div>
 
@@ -48,7 +49,7 @@
         <span class="val"><span class="dot" id="cloud_dot"></span><span id="cloud_status">检测中…</span></span>
       </div>
       <div class="row">
-        <span class="label">设备登记</span>
+        <span class="label">绑定状态</span>
         <span class="val" id="device_status">—</span>
       </div>
       <div class="row">
@@ -66,14 +67,14 @@
       <ol class="steps">
         <li>确认热点 SSID 与机身贴纸一致</li>
         <li>插入客户网线，等待拿到 LAN IP</li>
-        <li>云可达后自动 phone-home → 后台「待接管」</li>
-        <li>运维在云端批准并下发组网；组网成功后热点自动关闭</li>
+        <li>云可达后自动绑定入网（无需本页点绑定、无需后台再点批准）</li>
+        <li>有上行（能上网）后热点自动关闭；断网时再开便于维护（与是否已绑定无关）</li>
       </ol>
       <a class="btn" href="http://192.168.88.1:81/" id="status81">本机状态页 :81</a>
-      <a class="btn" href="https://sdwan.higmcn.com/admin" target="_blank" rel="noopener">云管理后台</a>
+      <div class="infobox">云管理后台请断开本机热点、用手机流量或办公网打开 https://sdwan.higmcn.com/admin（本热点内打开会撞本机自签证书）。</div>
     </div>
 
-    <div class="warnbox" id="psk_note">Wi‑Fi 密码见机身贴纸／出厂清单；本页<strong>不显示</strong>热点密码与 enrollment 令牌。</div>
+    <div class="warnbox" id="psk_note">初始化热点为 <strong>WPA2</strong>，现阶段默认密码 <strong>88888888</strong>（量产将改为每台随机，机身贴纸／管理后台「热点密码」可查）；<strong>有上行</strong>后自动关闭，断网时再开便于维护。本页不显示绑定令牌与 PSK。</div>
 
     <footer>
       金维组网现场初始化页 · SoftAP 网段 192.168.88.0/24 与客户 LAN／overlay 隔离。<br />
@@ -91,15 +92,23 @@
         document.getElementById('lan_ip').textContent = j.lan_ip || '（尚未拿到）';
         const cloud = !!j.cloud_reachable;
         document.getElementById('cloud_dot').className = 'dot ' + (cloud ? 'ok' : 'warn');
-        document.getElementById('cloud_status').textContent = cloud ? '可达' : '不可达（先插网线）';
-        document.getElementById('device_status').textContent = j.device_enrolled
-          ? ('已登记 ' + (j.device_id_short || ''))
-          : '未登记／等待 phone-home';
+        document.getElementById('cloud_status').textContent = cloud ? '可达' : (j.lan_ip ? '不可达（DNS／出站异常）' : '不可达（先插网线）');
+        if (j.device_enrolled) {
+          document.getElementById('device_status').textContent = '已绑定 ' + (j.device_id_short || '');
+        } else if (j.lan_ip && cloud) {
+          document.getElementById('device_status').textContent = '正在自动绑定…';
+        } else {
+          document.getElementById('device_status').textContent = '未绑定（插网线后自动绑定）';
+        }
         const et = j.easytier || 'absent';
         document.getElementById('et_status').textContent = et;
         document.getElementById('et_dot').className = 'dot ' + (et === 'running' ? 'ok' : (et === 'installed' ? 'warn' : 'bad'));
-        if (j.lan_ip) {
-          document.getElementById('cable_hint').textContent = '已检测到 LAN IP ' + j.lan_ip + '。若云可达，请到管理后台查看「待接管」。';
+        if (j.device_enrolled) {
+          document.getElementById('cable_hint').textContent = '已绑定' + (j.device_id_short ? (' ' + j.device_id_short) : '') + '。热点只看上行：有网关关、断网开。';
+        } else if (j.lan_ip && cloud) {
+          document.getElementById('cable_hint').textContent = '已检测到 LAN IP ' + j.lan_ip + '，云可达，正在自动绑定…';
+        } else if (j.lan_ip) {
+          document.getElementById('cable_hint').textContent = '已检测到 LAN IP ' + j.lan_ip + '。等待云可达后自动绑定。';
         }
       } catch (e) {
         document.getElementById('cloud_status').textContent = '本机 CGI 失败';

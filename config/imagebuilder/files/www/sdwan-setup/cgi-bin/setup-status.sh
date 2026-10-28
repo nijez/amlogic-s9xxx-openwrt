@@ -33,10 +33,30 @@ if pgrep -x easytier-core >/dev/null 2>&1 || pgrep easytier-core >/dev/null 2>&1
 fi
 
 MGMT_URL="https://sdwan.higmcn.com"
+[ -f /etc/sdwan-agent/config ] && . /etc/sdwan-agent/config 2>/dev/null || true
 [ -f /etc/sdwan-ui/ui.conf ] && . /etc/sdwan-ui/ui.conf 2>/dev/null || true
+
 CLOUD="false"
-code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "${MGMT_URL}/health" 2>/dev/null || echo 000)
-[ "$code" = "200" ] && CLOUD="true"
+check_cloud() {
+  _url="$1"
+  _code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$_url" 2>/dev/null || echo 000)
+  case "$_code" in
+    200|204|301|302) return 0 ;;
+  esac
+  _host=$(printf '%s' "$_url" | sed -n 's|https://\([^/]*\).*|\1|p')
+  [ -n "$_host" ] || return 1
+  _ip=$(nslookup "$_host" 10.0.0.1 2>/dev/null | awk '/^Address: /{a=$2} END{print a}')
+  [ -n "$_ip" ] || _ip=$(nslookup "$_host" 223.5.5.5 2>/dev/null | awk '/^Address: /{a=$2} END{print a}')
+  [ -n "$_ip" ] || return 1
+  _code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' --resolve "${_host}:443:${_ip}" "$_url" 2>/dev/null || echo 000)
+  case "$_code" in
+    200|204|301|302) return 0 ;;
+  esac
+  return 1
+}
+if check_cloud "${MGMT_URL}/v1/health" || check_cloud "${MGMT_URL}/health"; then
+  CLOUD="true"
+fi
 
 ENROLLED="false"
 [ -n "$DEVICE_ID" ] && ENROLLED="true"

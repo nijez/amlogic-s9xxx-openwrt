@@ -21,8 +21,9 @@ start_service() {
 }
 
 stop_service() {
-	# Agent holds /var/run/sdwan-agent.lock; clear after procd stops instance
-	rm -rf /var/run/sdwan-agent.lock
+	# Agent holds /var/run/sdwan-agent.flock; clear leftovers so restart does not crash-loop
+	killall -9 sdwan-agent 2>/dev/null || true
+	rm -f /var/run/sdwan-agent.flock /var/run/sdwan-agent.flock.pid /var/run/sdwan-agent.pid /var/run/sdwan-agent.lock
 }
 
 reload_service() {

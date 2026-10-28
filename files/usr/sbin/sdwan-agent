@@ -170,13 +170,31 @@ http_json() {
   fi
 }
 
+json_str_escape() {
+  # JSON 字符串转义（引号／反斜杠）；SSID／PSK 通常无特殊字符
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+read_softap_field() {
+  _f="$1"
+  if [ -f "$_f" ] && [ -s "$_f" ]; then
+    tr -d '\n\r' < "$_f"
+  else
+    printf ''
+  fi
+}
+
 do_enroll() {
   mid="$(detect_machine_id)"
   mac="$(detect_mac)"
   model="$(detect_model)"
   fw="$(detect_firmware)"
-  body=$(printf '{"machine_id":"%s","mac":"%s","model":"%s","firmware":"%s","enroll_token":"%s"}' \
-    "$mid" "$mac" "$model" "$fw" "$ENROLL_TOKEN")
+  softap_ssid="$(read_softap_field /etc/jinwei/setup-ssid)"
+  softap_psk="$(read_softap_field /etc/jinwei/setup-psk)"
+  softap_ssid_j="$(json_str_escape "$softap_ssid")"
+  softap_psk_j="$(json_str_escape "$softap_psk")"
+  body=$(printf '{"machine_id":"%s","mac":"%s","model":"%s","firmware":"%s","enroll_token":"%s","softap_ssid":"%s","softap_psk":"%s"}' \
+    "$mid" "$mac" "$model" "$fw" "$ENROLL_TOKEN" "$softap_ssid_j" "$softap_psk_j")
   resp="$(http_json POST /v1/devices/enroll "$body")"
   ok="$(json_get "$resp" ok)"
   if [ "$ok" != "true" ] && [ "$ok" != "True" ] && [ "$ok" != "1" ]; then
@@ -210,7 +228,12 @@ do_heartbeat() {
   peers_json="$(printf '%s' "$stats" | sed -n '1p')"
   vpn_ip="$(printf '%s' "$stats" | sed -n '2p')"
   [ -n "$peers_json" ] || peers_json='[]'
-  body=$(printf '{"agent_version":"0.2.3","easytier":"%s","lan_ip":"%s","vpn_ipv4":"%s","peers":%s}' "$et" "$lan" "$vpn_ip" "$peers_json")
+  softap_ssid="$(read_softap_field /etc/jinwei/setup-ssid)"
+  softap_psk="$(read_softap_field /etc/jinwei/setup-psk)"
+  softap_ssid_j="$(json_str_escape "$softap_ssid")"
+  softap_psk_j="$(json_str_escape "$softap_psk")"
+  body=$(printf '{"agent_version":"0.2.4","easytier":"%s","lan_ip":"%s","vpn_ipv4":"%s","peers":%s,"softap_ssid":"%s","softap_psk":"%s"}' \
+    "$et" "$lan" "$vpn_ip" "$peers_json" "$softap_ssid_j" "$softap_psk_j")
   resp="$(http_json POST /v1/devices/me/heartbeat "$body" "$DEVICE_TOKEN")"
   echo "$resp" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'
 }

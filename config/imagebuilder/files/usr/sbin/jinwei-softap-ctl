@@ -1,5 +1,8 @@
 #!/bin/sh
-# 金维 SoftAP 开关：未 enroll（或 EasyTier 未跑）→ 开；已 enroll 且 EasyTier 在跑 → 关。
+# 金维 SoftAP：
+# - 有默认路由／上行 → 关（正常在线，不广播维护热点）
+# - 无上行（断网）→ 开（急救／维护）；绑定与否不决定开关
+# 现阶段默认 WPA2-PSK 88888888，存 /etc/jinwei/setup-psk；量产再改为随机。心跳可上报云端供维护后台查看。
 # 用法: jinwei-softap-ctl reconcile|on|off|status
 set -eu
 IFACE_NAME=jinwei_setup
@@ -7,13 +10,15 @@ JINWEI_DIR=/etc/jinwei
 SSID_FILE="$JINWEI_DIR/setup-ssid"
 PSK_FILE="$JINWEI_DIR/setup-psk"
 
-is_enrolled() {
+is_bound() {
+	# 与现网 enroll 一致：有 DEVICE_ID 即已绑定到管理后台
 	[ -f /etc/sdwan-agent/state ] || return 1
 	grep -qE '^DEVICE_ID=.+' /etc/sdwan-agent/state 2>/dev/null
 }
 
-easytier_up() {
-	pgrep -x easytier-core >/dev/null 2>&1 || pgrep easytier-core >/dev/null 2>&1
+has_uplink() {
+	# 有默认路由视为「有网」（旁路由插上网线拿 DHCP 后通常即有）
+	ip route show default 2>/dev/null | grep -q .
 }
 
 ensure_network_setup() {
@@ -23,7 +28,13 @@ set network.setup=interface
 set network.setup.proto='static'
 set network.setup.ipaddr='192.168.88.1'
 set network.setup.netmask='255.255.255.0'
+set network.setup.type='bridge'
+set network.setup.bridge_empty='1'
 EOC
+		uci commit network
+	else
+		uci -q set network.setup.type='bridge'
+		uci -q set network.setup.bridge_empty='1'
 		uci commit network
 	fi
 	if ! uci -q get dhcp.setup >/dev/null 2>&1; then
@@ -40,12 +51,61 @@ EOC
 	fi
 }
 
+ensure_captive_conf() {
+	# 仅劫持探测域名；禁止 address=/#/（会劫持本机解析 sdwan.higmcn.com → 88.1）
+	mkdir -p /etc/jinwei /tmp/dnsmasq.d
+	chmod 755 /etc/jinwei
+	if [ ! -f /etc/jinwei/dnsmasq-setup-captive.conf ]; then
+		cat > /etc/jinwei/dnsmasq-setup-captive.conf <<'CFG'
+# SoftAP 强制门户：仅劫持探测域名，勿用 address=/#/（会连本机解析管理域名也指到 88.1）
+address=/captive.apple.com/192.168.88.1
+address=/www.apple.com/192.168.88.1
+address=/www.appleiphonecell.com/192.168.88.1
+address=/www.itools.info/192.168.88.1
+address=/www.ibook.info/192.168.88.1
+address=/www.airport.us/192.168.88.1
+address=/www.thinkdifferent.us/192.168.88.1
+address=/connectivitycheck.gstatic.com/192.168.88.1
+address=/connectivitycheck.android.com/192.168.88.1
+address=/clients3.google.com/192.168.88.1
+address=/connect.rom.miui.com/192.168.88.1
+address=/www.msftconnecttest.com/192.168.88.1
+address=/dns.msftncsi.com/192.168.88.1
+CFG
+	fi
+	# 现网若残留 catch-all，立刻清掉再拷到 /tmp
+	if grep -qE '^[[:space:]]*address=/#/' /etc/jinwei/dnsmasq-setup-captive.conf 2>/dev/null; then
+		grep -vE '^[[:space:]]*address=/#/' /etc/jinwei/dnsmasq-setup-captive.conf > /tmp/jinwei-setup-captive.conf.new
+		mv /tmp/jinwei-setup-captive.conf.new /etc/jinwei/dnsmasq-setup-captive.conf
+	fi
+	chmod 644 /etc/jinwei/dnsmasq-setup-captive.conf
+	cp /etc/jinwei/dnsmasq-setup-captive.conf /tmp/dnsmasq.d/jinwei-setup-captive.conf
+	chmod 644 /tmp/dnsmasq.d/jinwei-setup-captive.conf
+}
+
+# 现阶段默认 PSK 88888888：缺文件或空则写入该默认（量产再改随机）；chmod 600
+ensure_psk() {
+	mkdir -p "$JINWEI_DIR"
+	chmod 755 "$JINWEI_DIR"
+	if [ -f "$PSK_FILE" ] && [ -s "$PSK_FILE" ]; then
+		PSK=$(tr -d '\n\r' < "$PSK_FILE")
+		[ -n "$PSK" ] && [ ${#PSK} -ge 8 ] && return 0
+	fi
+	PSK="88888888"
+	printf '%s\n' "$PSK" > "$PSK_FILE"
+	chmod 600 "$PSK_FILE"
+	return 0
+}
+
 ensure_iface() {
 	[ -f /etc/config/wireless ] || return 1
 	ensure_network_setup
+	ensure_captive_conf
 	SSID=$(tr -d '\n\r' < "$SSID_FILE" 2>/dev/null || true)
+	[ -n "$SSID" ] || return 1
+	ensure_psk || return 1
 	PSK=$(tr -d '\n\r' < "$PSK_FILE" 2>/dev/null || true)
-	[ -n "$SSID" ] && [ -n "$PSK" ] || return 1
+	[ -n "$PSK" ] || return 1
 	uci -q batch <<EOC
 set wireless.${IFACE_NAME}=wifi-iface
 set wireless.${IFACE_NAME}.device='radio0'
@@ -56,34 +116,47 @@ set wireless.${IFACE_NAME}.encryption='psk2'
 set wireless.${IFACE_NAME}.key='$PSK'
 EOC
 	uci -q set wireless.radio0.disabled=0
+	uci -q set wireless.radio0.band='2g'
+	uci -q set wireless.radio0.channel='6'
+	uci -q set wireless.radio0.htmode='HT20'
 	uci commit wireless
 	return 0
 }
 
 set_disabled() {
-	want="$1" # 0=on 1=off
+	want="$1"
 	ensure_iface || return 0
 	uci -q set "wireless.$IFACE_NAME.disabled=$want"
-	uci -q set wireless.radio0.disabled=0
-	uci commit wireless
-	wifi reload 2>/dev/null || wifi up 2>/dev/null || true
+	if [ "$want" = 1 ]; then
+		# SoftAP 关闭时一并关 radio，并 wifi down 拆掉残留 Master／hostapd
+		uci -q set wireless.radio0.disabled=1
+		uci commit wireless
+		wifi down 2>/dev/null || true
+		iw dev phy0-ap0 del 2>/dev/null || true
+	else
+		uci -q set wireless.radio0.disabled=0
+		uci commit wireless
+		wifi reload 2>/dev/null || wifi up 2>/dev/null || true
+	fi
 }
 
 cmd_status() {
-	enrolled=0; is_enrolled && enrolled=1
-	et=0; easytier_up && et=1
+	bound=0; is_bound && bound=1
+	uplink=0; has_uplink && uplink=1
 	dis=$(uci -q get "wireless.$IFACE_NAME.disabled" 2>/dev/null || echo "?")
 	ssid=$(cat "$SSID_FILE" 2>/dev/null || echo "")
-	printf 'enrolled=%s easytier=%s softap_disabled=%s ssid=%s\n' "$enrolled" "$et" "$dis" "$ssid"
+	enc=$(uci -q get "wireless.$IFACE_NAME.encryption" 2>/dev/null || echo "?")
+	printf 'bound=%s uplink=%s softap_disabled=%s ssid=%s encryption=%s\n' "$bound" "$uplink" "$dis" "$ssid" "$enc"
 }
 
 cmd_reconcile() {
-	if is_enrolled && easytier_up; then
+	# 只看上行：有网关／默认路由则关；断网则开。绑定状态不参与开关。
+	if has_uplink; then
 		set_disabled 1
-		echo "softap: off (enrolled+easytier)"
+		echo "softap: off (uplink)"
 	else
 		set_disabled 0
-		echo "softap: on (need setup or easytier down)"
+		echo "softap: on (no uplink, maintenance)"
 	fi
 }
 
