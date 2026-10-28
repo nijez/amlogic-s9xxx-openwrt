@@ -1,0 +1,28 @@
+#!/bin/sh
+# Factory SD-WAN: force LAN as DHCP client (旁路由), disable local DHCP/RA.
+# Runs once on first boot; uci-defaults deletes itself after success.
+
+uci -q batch <<'EOC'
+set network.lan.proto='dhcp'
+delete network.lan.ipaddr
+delete network.lan.netmask
+delete network.lan.ip6assign
+set dhcp.lan.ignore='1'
+delete dhcp.lan.ra
+delete dhcp.lan.dhcpv6
+delete dhcp.lan.ra_management
+delete dhcp.lan.ra_default
+EOC
+
+# Some ImmortalWrt builds use dhcp.lan.ra='server' etc.
+uci -q set dhcp.lan.dhcpv4='disabled' 2>/dev/null || true
+uci -q set dhcp.lan.ra='disabled' 2>/dev/null || true
+uci -q set dhcp.lan.dhcpv6='disabled' 2>/dev/null || true
+
+uci commit network
+uci commit dhcp
+
+# Ensure phone-home agent is enabled
+[ -x /etc/init.d/sdwan-agent ] && /etc/init.d/sdwan-agent enable
+
+exit 0

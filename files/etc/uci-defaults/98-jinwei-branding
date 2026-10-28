@@ -1,0 +1,19 @@
+#!/bin/sh
+# 金维组网：首启品牌与 LuCI 对外展示收敛（阶段0）
+# 不删 LuCI 包；量产可另用 97-jinwei-luci-listen 关 WAN 或停 LuCI。
+
+# 系统主机名（状态页 / SSH banner 可见）
+uci -q set system.@system[0].hostname='JinweiSDWAN'
+uci -q set system.@system[0].description='金维组网'
+uci commit system
+
+# LuCI 语言优先中文（若已装 luci-i18n-zh-cn）
+if uci -q get luci.main >/dev/null 2>&1; then
+  uci -q set luci.main.lang='zh_cn'
+  uci commit luci
+fi
+
+# 若存在自有静态资源，可在此启用（阶段1 ImageBuilder 带上 /www/luci-static/sdwan）
+# 不强制改 theme：不同 ImmortalWrt 主题路径不一，以免首启失败。
+
+exit 0

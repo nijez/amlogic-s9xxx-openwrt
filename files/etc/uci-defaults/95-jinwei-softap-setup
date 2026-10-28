@@ -1,0 +1,139 @@
+#!/bin/sh
+# 金维组网：现场 SoftAP 初始化（独立 setup 网段，勿桥进 br-lan）
+# 对齐 docs/25：SSID「金维组网-XXXX」+ WPA2；PSK 首次启动随机写入本地；未 enroll 时由 jinwei-softap 维持开启。
+
+JINWEI_DIR=/etc/jinwei
+SSID_FILE="$JINWEI_DIR/setup-ssid"
+PSK_FILE="$JINWEI_DIR/setup-psk"
+IFACE_NAME=jinwei_setup
+
+mkdir -p "$JINWEI_DIR"
+chmod 700 "$JINWEI_DIR"
+
+# --- MAC 后缀（优先 eth0，再 br-lan / 任意有线）---
+mac_raw=""
+for n in eth0 eth1 br-lan; do
+	[ -r "/sys/class/net/$n/address" ] || continue
+	mac_raw=$(tr -d ':\n' < "/sys/class/net/$n/address")
+	[ -n "$mac_raw" ] && break
+done
+if [ -z "$mac_raw" ]; then
+	mac_raw=$(cat /sys/class/net/*/address 2>/dev/null | head -n1 | tr -d ':\n')
+fi
+mac_raw=$(printf '%s' "$mac_raw" | tr 'a-f' 'A-F')
+suffix=$(printf '%s' "$mac_raw" | tail -c 4)
+[ -n "$suffix" ] || suffix="0000"
+SSID="金维组网-${suffix}"
+
+# --- PSK：已有文件复用（构建注入）；否则随机 ≥8 位复合（字母+数字）---
+if [ -f "$PSK_FILE" ] && [ -s "$PSK_FILE" ]; then
+	PSK=$(tr -d '\n\r' < "$PSK_FILE")
+else
+	# OpenWrt busybox：用 /dev/urandom
+	i=0
+	PSK=""
+	while [ $i -lt 8 ]; do
+		PSK=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 12)
+		# 字母+数字复合且 ≥8
+		case "$PSK" in
+			*[A-Za-z]*[0-9]*|*[0-9]*[A-Za-z]*)
+				[ ${#PSK} -ge 8 ] && break
+				;;
+		esac
+		# 强制复合后缀（仍来自本轮随机前缀，非全网统一口令）
+		PSK="Jw$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 8)7"
+		[ ${#PSK} -ge 8 ] && break
+		i=$((i+1))
+	done
+	[ ${#PSK} -ge 8 ] || { echo "jinwei-softap: PSK generate failed" >&2; exit 1; }
+	printf '%s\n' "$PSK" > "$PSK_FILE"
+	chmod 600 "$PSK_FILE"
+fi
+printf '%s\n' "$SSID" > "$SSID_FILE"
+chmod 644 "$SSID_FILE"
+# 机身贴纸用：不把 PSK 写进 banner／git；运维可 cat /etc/jinwei/setup-psk
+printf '%s\n' "$SSID" > "$JINWEI_DIR/setup-ssid.txt"
+printf 'SSID=%s\nPSK_FILE=%s\nSETUP_GW=192.168.88.1\n' "$SSID" "$PSK_FILE" > "$JINWEI_DIR/setup-sticker.env"
+chmod 600 "$JINWEI_DIR/setup-sticker.env"
+
+# --- 独立 setup 接口 ---
+uci -q batch <<EOC
+set network.setup=interface
+set network.setup.proto='static'
+set network.setup.ipaddr='192.168.88.1'
+set network.setup.netmask='255.255.255.0'
+EOC
+uci commit network
+
+# --- DHCP on setup（仅 SoftAP 客户端）---
+uci -q batch <<EOC
+set dhcp.setup=dhcp
+set dhcp.setup.interface='setup'
+set dhcp.setup.start='100'
+set dhcp.setup.limit='50'
+set dhcp.setup.leasetime='1h'
+set dhcp.setup.dhcpv6='disabled'
+set dhcp.setup.ra='disabled'
+EOC
+uci commit dhcp
+
+# --- 防火墙 zone：setup 可入可出，不转发进 lan ---
+if ! uci -q get firewall.jinwei_setup >/dev/null 2>&1; then
+	uci -q batch <<'EOC'
+set firewall.jinwei_setup=zone
+set firewall.jinwei_setup.name='setup'
+set firewall.jinwei_setup.input='ACCEPT'
+set firewall.jinwei_setup.output='ACCEPT'
+set firewall.jinwei_setup.forward='REJECT'
+add_list firewall.jinwei_setup.network='setup'
+EOC
+	uci commit firewall
+fi
+
+# --- 无线：等 /etc/config/wireless；关掉社区默认开放 AP；建金维 SoftAP ---
+# uci-defaults 可能早于 wifi detect；缺文件则留给 init 补跑
+if [ -f /etc/config/wireless ]; then
+	# 启用 radio0（N1 板载）
+	uci -q set wireless.radio0.disabled='0'
+	# 禁用所有现有 AP iface（避免 ImmortalWrt 开放热点桥进 lan）
+	for sec in $(uci -q show wireless | sed -n "s/^wireless\.\([^=]*\)=wifi-iface.*/\1/p"); do
+		uci -q set "wireless.$sec.disabled=1"
+	done
+	# 新建／覆盖金维 setup AP
+	uci -q batch <<EOC
+set wireless.${IFACE_NAME}=wifi-iface
+set wireless.${IFACE_NAME}.device='radio0'
+set wireless.${IFACE_NAME}.mode='ap'
+set wireless.${IFACE_NAME}.network='setup'
+set wireless.${IFACE_NAME}.ssid='$SSID'
+set wireless.${IFACE_NAME}.encryption='psk2'
+set wireless.${IFACE_NAME}.key='$PSK'
+set wireless.${IFACE_NAME}.disabled='0'
+EOC
+	# 5G 优先（现网 N1 曾用 ch36）；失败时驱动自协商
+	uci -q set wireless.radio0.channel='36' 2>/dev/null || true
+	uci -q set wireless.radio0.htmode='VHT80' 2>/dev/null || true
+	uci commit wireless
+	wifi reload 2>/dev/null || wifi up 2>/dev/null || true
+fi
+
+# uhttpd：setup 网段 :80 → 初始化页（与 :81 并存）
+if [ -d /www/sdwan-setup ] && [ -x /etc/init.d/uhttpd ]; then
+	if ! uci -q get uhttpd.jinwei_setup >/dev/null 2>&1; then
+		uci -q batch <<'UCI'
+set uhttpd.jinwei_setup=uhttpd
+set uhttpd.jinwei_setup.listen_http='192.168.88.1:80'
+set uhttpd.jinwei_setup.home='/www/sdwan-setup'
+set uhttpd.jinwei_setup.cgi_prefix='/cgi-bin'
+add_list uhttpd.jinwei_setup.interpreter='.sh=/bin/sh'
+set uhttpd.jinwei_setup.index_page='index.html'
+set uhttpd.jinwei_setup.rfc1918_filter='0'
+UCI
+		uci commit uhttpd
+	fi
+fi
+
+# 启用 SoftAP 守护（未 enroll 开、组网成功关）
+[ -x /etc/init.d/jinwei-softap ] && /etc/init.d/jinwei-softap enable
+
+exit 0

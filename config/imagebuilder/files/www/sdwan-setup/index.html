@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>金维组网 · 本机初始化</title>
+  <style>
+    :root { --bg:#0f1419; --card:#1a2332; --fg:#e7ecf3; --muted:#8b9bb4; --ok:#3dd68c; --warn:#f5a524; --bad:#f31260; --line:#2a3548; --acc:#5b9fff; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--fg); }
+    main { max-width: 420px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: .85rem; margin-bottom: 16px; line-height:1.45; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    .row { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .row:last-child { border-bottom: none; }
+    .label { color: var(--muted); font-size: .8rem; flex-shrink:0; }
+    .val { font-size: .92rem; text-align:right; word-break: break-all; }
+    .hint { background:#1e2a1e; border:1px solid #2f4a2f; color:var(--ok); border-radius:10px; padding:12px; font-size:.9rem; line-height:1.45; margin-bottom:12px; }
+    .warnbox { background:#2a2210; border:1px solid #5a4418; color:var(--warn); border-radius:10px; padding:12px; font-size:.9rem; line-height:1.45; margin-bottom:12px; }
+    .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background: var(--muted); }
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.bad { background: var(--bad); }
+    a.btn { display:block; text-align:center; text-decoration:none; color:var(--fg); background:#243044; border:1px solid var(--line); border-radius:10px; padding:12px; margin-top:8px; }
+    footer { margin-top: 18px; color: var(--muted); font-size: .72rem; line-height:1.4; }
+    ol.steps { margin:0; padding-left:1.2rem; color:var(--fg); font-size:.9rem; line-height:1.55; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>金维组网 · 本机初始化</h1>
+    <p class="sub">手机已连本机热点。有线是业务主路径；热点只用于初始化／急救。</p>
+
+    <div class="hint" id="cable_hint">请将网线插入盒子 LAN，接到客户交换机／主路由 LAN（旁路由，本机不开 DHCP）。</div>
+
+    <div class="card">
+      <div class="row"><span class="label">本机 SSID</span><span class="val" id="ssid">—</span></div>
+      <div class="row"><span class="label">MAC</span><span class="val" id="mac">—</span></div>
+      <div class="row"><span class="label">型号</span><span class="val" id="model">—</span></div>
+      <div class="row"><span class="label">Setup 网关</span><span class="val">192.168.88.1</span></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <span class="label">云管理</span>
+        <span class="val"><span class="dot" id="cloud_dot"></span><span id="cloud_status">检测中…</span></span>
+      </div>
+      <div class="row">
+        <span class="label">设备登记</span>
+        <span class="val" id="device_status">—</span>
+      </div>
+      <div class="row">
+        <span class="label">组网</span>
+        <span class="val"><span class="dot" id="et_dot"></span><span id="et_status">—</span></span>
+      </div>
+      <div class="row">
+        <span class="label">LAN IP</span>
+        <span class="val" id="lan_ip">（插网线后由客户 DHCP 分配）</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label" style="margin-bottom:8px">现场步骤</div>
+      <ol class="steps">
+        <li>确认热点 SSID 与机身贴纸一致</li>
+        <li>插入客户网线，等待拿到 LAN IP</li>
+        <li>云可达后自动 phone-home → 后台「待接管」</li>
+        <li>运维在云端批准并下发组网；组网成功后热点自动关闭</li>
+      </ol>
+      <a class="btn" href="http://192.168.88.1:81/" id="status81">本机状态页 :81</a>
+      <a class="btn" href="https://sdwan.higmcn.com/admin" target="_blank" rel="noopener">云管理后台</a>
+    </div>
+
+    <div class="warnbox" id="psk_note">Wi‑Fi 密码见机身贴纸／出厂清单；本页<strong>不显示</strong>热点密码与 enrollment 令牌。</div>
+
+    <footer>
+      金维组网现场初始化页 · SoftAP 网段 192.168.88.0/24 与客户 LAN／overlay 隔离。<br />
+      约每 10 秒刷新；不含密钥。
+    </footer>
+  </main>
+  <script>
+    async function refresh() {
+      try {
+        const r = await fetch('/cgi-bin/setup-status.sh', { cache: 'no-store' });
+        const j = await r.json();
+        document.getElementById('ssid').textContent = j.ssid || '—';
+        document.getElementById('mac').textContent = j.mac || '—';
+        document.getElementById('model').textContent = j.model || '—';
+        document.getElementById('lan_ip').textContent = j.lan_ip || '（尚未拿到）';
+        const cloud = !!j.cloud_reachable;
+        document.getElementById('cloud_dot').className = 'dot ' + (cloud ? 'ok' : 'warn');
+        document.getElementById('cloud_status').textContent = cloud ? '可达' : '不可达（先插网线）';
+        document.getElementById('device_status').textContent = j.device_enrolled
+          ? ('已登记 ' + (j.device_id_short || ''))
+          : '未登记／等待 phone-home';
+        const et = j.easytier || 'absent';
+        document.getElementById('et_status').textContent = et;
+        document.getElementById('et_dot').className = 'dot ' + (et === 'running' ? 'ok' : (et === 'installed' ? 'warn' : 'bad'));
+        if (j.lan_ip) {
+          document.getElementById('cable_hint').textContent = '已检测到 LAN IP ' + j.lan_ip + '。若云可达，请到管理后台查看「待接管」。';
+        }
+      } catch (e) {
+        document.getElementById('cloud_status').textContent = '本机 CGI 失败';
+      }
+    }
+    refresh();
+    setInterval(refresh, 10000);
+  </script>
+</body>
+</html>

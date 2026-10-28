@@ -1,0 +1,96 @@
+#!/bin/sh
+# 金维 SoftAP 开关：未 enroll（或 EasyTier 未跑）→ 开；已 enroll 且 EasyTier 在跑 → 关。
+# 用法: jinwei-softap-ctl reconcile|on|off|status
+set -eu
+IFACE_NAME=jinwei_setup
+JINWEI_DIR=/etc/jinwei
+SSID_FILE="$JINWEI_DIR/setup-ssid"
+PSK_FILE="$JINWEI_DIR/setup-psk"
+
+is_enrolled() {
+	[ -f /etc/sdwan-agent/state ] || return 1
+	grep -qE '^DEVICE_ID=.+' /etc/sdwan-agent/state 2>/dev/null
+}
+
+easytier_up() {
+	pgrep -x easytier-core >/dev/null 2>&1 || pgrep easytier-core >/dev/null 2>&1
+}
+
+ensure_network_setup() {
+	if ! uci -q get network.setup >/dev/null 2>&1; then
+		uci -q batch <<'EOC'
+set network.setup=interface
+set network.setup.proto='static'
+set network.setup.ipaddr='192.168.88.1'
+set network.setup.netmask='255.255.255.0'
+EOC
+		uci commit network
+	fi
+	if ! uci -q get dhcp.setup >/dev/null 2>&1; then
+		uci -q batch <<'EOC'
+set dhcp.setup=dhcp
+set dhcp.setup.interface='setup'
+set dhcp.setup.start='100'
+set dhcp.setup.limit='50'
+set dhcp.setup.leasetime='1h'
+set dhcp.setup.dhcpv6='disabled'
+set dhcp.setup.ra='disabled'
+EOC
+		uci commit dhcp
+	fi
+}
+
+ensure_iface() {
+	[ -f /etc/config/wireless ] || return 1
+	ensure_network_setup
+	SSID=$(tr -d '\n\r' < "$SSID_FILE" 2>/dev/null || true)
+	PSK=$(tr -d '\n\r' < "$PSK_FILE" 2>/dev/null || true)
+	[ -n "$SSID" ] && [ -n "$PSK" ] || return 1
+	uci -q batch <<EOC
+set wireless.${IFACE_NAME}=wifi-iface
+set wireless.${IFACE_NAME}.device='radio0'
+set wireless.${IFACE_NAME}.mode='ap'
+set wireless.${IFACE_NAME}.network='setup'
+set wireless.${IFACE_NAME}.ssid='$SSID'
+set wireless.${IFACE_NAME}.encryption='psk2'
+set wireless.${IFACE_NAME}.key='$PSK'
+EOC
+	uci -q set wireless.radio0.disabled=0
+	uci commit wireless
+	return 0
+}
+
+set_disabled() {
+	want="$1" # 0=on 1=off
+	ensure_iface || return 0
+	uci -q set "wireless.$IFACE_NAME.disabled=$want"
+	uci -q set wireless.radio0.disabled=0
+	uci commit wireless
+	wifi reload 2>/dev/null || wifi up 2>/dev/null || true
+}
+
+cmd_status() {
+	enrolled=0; is_enrolled && enrolled=1
+	et=0; easytier_up && et=1
+	dis=$(uci -q get "wireless.$IFACE_NAME.disabled" 2>/dev/null || echo "?")
+	ssid=$(cat "$SSID_FILE" 2>/dev/null || echo "")
+	printf 'enrolled=%s easytier=%s softap_disabled=%s ssid=%s\n' "$enrolled" "$et" "$dis" "$ssid"
+}
+
+cmd_reconcile() {
+	if is_enrolled && easytier_up; then
+		set_disabled 1
+		echo "softap: off (enrolled+easytier)"
+	else
+		set_disabled 0
+		echo "softap: on (need setup or easytier down)"
+	fi
+}
+
+case "${1:-reconcile}" in
+	reconcile) cmd_reconcile ;;
+	on) set_disabled 0; echo softap:on ;;
+	off) set_disabled 1; echo softap:off ;;
+	status) cmd_status ;;
+	*) echo "usage: $0 reconcile|on|off|status" >&2; exit 1 ;;
+esac

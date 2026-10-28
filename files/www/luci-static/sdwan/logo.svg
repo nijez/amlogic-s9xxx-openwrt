@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="金维组网">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5b9fff"/>
+      <stop offset="100%" stop-color="#3dd68c"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0f1419"/>
+  <rect x="4" y="4" width="56" height="56" rx="12" fill="none" stroke="url(#g)" stroke-width="2"/>
+  <path d="M18 44 V20 h8 l6 16 6-16 h8 v24 h-7 V30 l-5.5 14 h-3 L25 30 v14z" fill="url(#g)"/>
+  <circle cx="48" cy="18" r="4" fill="#3dd68c"/>
+</svg>

@@ -1,0 +1,6 @@
+# Reference snippet only — real apply is via uci-defaults/99-sdwan-dhcp-client.
+# ImageBuilder may merge; prefer uci-defaults for firstboot.
+#
+# config interface 'lan'
+#         option proto 'dhcp'
+#         option device 'br-lan'

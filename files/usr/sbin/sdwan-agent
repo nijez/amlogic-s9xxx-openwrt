@@ -1,0 +1,944 @@
+#!/bin/sh
+# Factory SD-WAN phone-home agent (stage0). POSIX sh + curl + (optional) jsonfilter.
+# Does NOT stop easytier-core when management plane is unreachable.
+
+CONF_DIR="${SDWAN_CONF_DIR:-/etc/sdwan-agent}"
+STATE_DIR="${SDWAN_STATE_DIR:-/etc/sdwan-agent}"
+CONF_FILE="${CONF_DIR}/config"
+STATE_FILE="${STATE_DIR}/state"
+LOG_TAG="sdwan-agent"
+LOCK_DIR="${SDWAN_LOCK_DIR:-/var/run/sdwan-agent.lock}"
+
+acquire_lock() {
+  # Prefer flock when available (BusyBox may have it).
+  if command -v flock >/dev/null 2>&1; then
+    LOCK_FD=9
+    eval "exec ${LOCK_FD}>/var/run/sdwan-agent.flock"
+    if ! flock -n "$LOCK_FD"; then
+      log "another instance holds flock; exiting"
+      exit 0
+    fi
+    echo $$ >/var/run/sdwan-agent.flock.pid
+    return 0
+  fi
+  # mkdir-based lock with short retry to close race
+  i=0
+  while [ "$i" -lt 5 ]; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo $$ >"$LOCK_DIR/pid"
+      return 0
+    fi
+    old="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+      log "another instance running (pid $old); exiting"
+      exit 0
+    fi
+    # stale
+    rm -rf "$LOCK_DIR"
+    i=$((i + 1))
+    sleep 1
+  done
+  log "could not acquire lock $LOCK_DIR"
+  exit 1
+}
+
+release_lock() {
+  rm -rf "$LOCK_DIR"
+}
+
+log() {
+  logger -t "$LOG_TAG" "$@" 2>/dev/null || echo "$(date -Iseconds 2>/dev/null || date) $*"
+}
+
+load_conf() {
+  if [ ! -f "$CONF_FILE" ]; then
+    log "missing config $CONF_FILE"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+  MGMT_URL="${MGMT_URL:-https://sdwan.higmcn.com}"
+  ENROLL_TOKEN="${ENROLL_TOKEN:-}"
+  MACHINE_ID="${MACHINE_ID:-}"
+  POLL_WAIT="${POLL_WAIT:-25}"
+  HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-45}"
+}
+
+save_state() {
+  mkdir -p "$STATE_DIR"
+  umask 077
+  {
+    echo "DEVICE_ID='$DEVICE_ID'"
+    echo "DEVICE_TOKEN='$DEVICE_TOKEN'"
+  } >"$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+}
+
+load_state() {
+  DEVICE_ID=""
+  DEVICE_TOKEN=""
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+  fi
+}
+
+detect_machine_id() {
+  if [ -n "$MACHINE_ID" ]; then
+    echo "$MACHINE_ID"
+    return
+  fi
+  if [ -f /etc/machine-id ]; then
+    tr -d '\n' </etc/machine-id
+    return
+  fi
+  # fallback: primary MAC without colons
+  mac="$(detect_mac | tr -d ':')"
+  echo "n1-${mac:-unknown}"
+}
+
+detect_mac() {
+  # Prefer eth0 / br-lan
+  for iface in eth0 br-lan end0 lan1; do
+    if [ -f "/sys/class/net/$iface/address" ]; then
+      cat "/sys/class/net/$iface/address"
+      return
+    fi
+  done
+  ip link 2>/dev/null | awk '/link\/ether/ {print $2; exit}'
+}
+
+detect_model() {
+  if [ -f /tmp/sysinfo/model ]; then
+    cat /tmp/sysinfo/model
+    return
+  fi
+  echo "unknown"
+}
+
+detect_firmware() {
+  if [ -f /etc/openwrt_release ]; then
+    # DISTRIB_DESCRIPTION='ImmortalWrt ...'
+    . /etc/openwrt_release 2>/dev/null
+    echo "${DISTRIB_DESCRIPTION:-unknown}"
+    return
+  fi
+  uname -r
+}
+
+detect_lan_ip() {
+  lan="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet / {print $2; exit}' | cut -d/ -f1)"
+  if [ -n "$lan" ]; then
+    echo "$lan"
+    return
+  fi
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+json_get() {
+  # json_get <json> <key>  — tiny extractor without python
+  _j="$1"
+  _k="$2"
+  if command -v jsonfilter >/dev/null 2>&1; then
+    printf '%s' "$_j" | jsonfilter -e "@.$_k" 2>/dev/null
+    return
+  fi
+  # sed fallback for simple string/number fields
+  printf '%s' "$_j" | sed -n "s/.*\"$_k\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1
+}
+
+http_json() {
+  # http_json METHOD PATH [body] [bearer]
+  _method="$1"
+  _path="$2"
+  _body="${3:-}"
+  _bearer="${4:-}"
+  _url="${MGMT_URL}${_path}"
+  if [ -n "$_bearer" ]; then
+    if [ -n "$_body" ]; then
+      curl -sS -m 35 -X "$_method"         -H "Content-Type: application/json"         -H "Accept: application/json"         -H "Authorization: Bearer ${_bearer}"         -d "$_body" "$_url" 2>/dev/null
+    else
+      curl -sS -m 35 -X "$_method"         -H "Content-Type: application/json"         -H "Accept: application/json"         -H "Authorization: Bearer ${_bearer}"         "$_url" 2>/dev/null
+    fi
+  else
+    if [ -n "$_body" ]; then
+      curl -sS -m 35 -X "$_method"         -H "Content-Type: application/json"         -H "Accept: application/json"         -d "$_body" "$_url" 2>/dev/null
+    else
+      curl -sS -m 35 -X "$_method"         -H "Content-Type: application/json"         -H "Accept: application/json"         "$_url" 2>/dev/null
+    fi
+  fi
+}
+
+do_enroll() {
+  mid="$(detect_machine_id)"
+  mac="$(detect_mac)"
+  model="$(detect_model)"
+  fw="$(detect_firmware)"
+  body=$(printf '{"machine_id":"%s","mac":"%s","model":"%s","firmware":"%s","enroll_token":"%s"}' \
+    "$mid" "$mac" "$model" "$fw" "$ENROLL_TOKEN")
+  resp="$(http_json POST /v1/devices/enroll "$body")"
+  ok="$(json_get "$resp" ok)"
+  if [ "$ok" != "true" ] && [ "$ok" != "True" ] && [ "$ok" != "1" ]; then
+    # try alternate: ok may be boolean without quotes in sed
+    echo "$resp" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || {
+      log "enroll failed: $resp"
+      return 1
+    }
+  fi
+  DEVICE_ID="$(json_get "$resp" device_id)"
+  DEVICE_TOKEN="$(json_get "$resp" device_token)"
+  if [ -z "$DEVICE_ID" ] || [ -z "$DEVICE_TOKEN" ]; then
+    log "enroll missing fields: $resp"
+    return 1
+  fi
+  save_state
+  log "enrolled device_id=$DEVICE_ID"
+  return 0
+}
+
+do_heartbeat() {
+  lan="$(detect_lan_ip)"
+  et="absent"
+  if command -v easytier-cli >/dev/null 2>&1; then
+    et="installed"
+  fi
+  if pgrep -x easytier-core >/dev/null 2>&1 || pgrep easytier-core >/dev/null 2>&1; then
+    et="running"
+  fi
+  stats="$(collect_peer_stats_json)"
+  peers_json="$(printf '%s' "$stats" | sed -n '1p')"
+  vpn_ip="$(printf '%s' "$stats" | sed -n '2p')"
+  [ -n "$peers_json" ] || peers_json='[]'
+  body=$(printf '{"agent_version":"0.2.3","easytier":"%s","lan_ip":"%s","vpn_ipv4":"%s","peers":%s}' "$et" "$lan" "$vpn_ip" "$peers_json")
+  resp="$(http_json POST /v1/devices/me/heartbeat "$body" "$DEVICE_TOKEN")"
+  echo "$resp" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'
+}
+
+report_task() {
+  _tid="$1"
+  _st="$2"
+  _detail="$3"
+  body=$(printf '{"task_id":"%s","status":"%s","detail":%s}' "$_tid" "$_st" "$_detail")
+  http_json POST /v1/devices/me/task-result "$body" "$DEVICE_TOKEN" >/dev/null
+}
+
+task_change_root_password() {
+  _tid="$1"
+  _params_json="$2"
+  np=""
+  if command -v jsonfilter >/dev/null 2>&1; then
+    np="$(printf '%s' "$_params_json" | jsonfilter -e '@.new_password' 2>/dev/null)"
+  fi
+  if [ -z "$np" ]; then
+    np="$(json_get "$_params_json" new_password)"
+  fi
+  if [ -z "$np" ]; then
+    np=$(printf '%s' "$_params_json" | sed -n 's/.*"new_password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+  fi
+  if [ -z "$np" ]; then
+    log "change_root_password: missing new_password"
+    report_task "$_tid" failed '{"error":"missing_password"}'
+    return 1
+  fi
+  changed=0
+  if command -v chpasswd >/dev/null 2>&1; then
+    if printf 'root:%s\n' "$np" | chpasswd; then
+      changed=1
+    fi
+  fi
+  if [ "$changed" -eq 0 ] && command -v passwd >/dev/null 2>&1; then
+    # BusyBox passwd: feed new password twice on stdin
+    if printf '%s\n%s\n' "$np" "$np" | passwd root >/dev/null 2>&1; then
+      changed=1
+    fi
+  fi
+  if [ "$changed" -eq 1 ]; then
+    log "change_root_password: ok"
+    report_task "$_tid" success '{"changed":true}'
+    return 0
+  fi
+  log "change_root_password: failed"
+  report_task "$_tid" failed '{"error":"password_change_failed"}'
+  return 1
+}
+
+task_install_easytier() {
+  _tid="$1"
+  _params_json="$2"
+  url="$(printf '%s' "$_params_json" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  sha="$(printf '%s' "$_params_json" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  dry="$(printf '%s' "$_params_json" | sed -n 's/.*"dry_run"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -n1)"
+  version="$(printf '%s' "$_params_json" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+
+  log "install_easytier: received version=$version dry_run=$dry"
+
+  if [ "$dry" = "true" ]; then
+    report_task "$_tid" success '{"dry_run":true,"received":true,"version":"'"$version"'"}'
+    return 0
+  fi
+
+  arch="$(uname -m)"
+  if [ "$arch" != "aarch64" ]; then
+    report_task "$_tid" failed '{"error":"unsupported_arch","arch":"'"$arch"'"}'
+    return 1
+  fi
+  if [ -z "$url" ] || [ -z "$sha" ]; then
+    report_task "$_tid" failed '{"error":"missing_url_or_sha"}'
+    return 1
+  fi
+
+  work="$(mktemp -d 2>/dev/null || echo /tmp/sdwan-et.$$)"
+  mkdir -p "$work"
+  zipf="$work/et.zip"
+  if ! curl -fsSL --retry 3 -m 300 -o "$zipf" "$url"; then
+    report_task "$_tid" failed '{"error":"download_failed"}'
+    rm -rf "$work"
+    return 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "$sha  $zipf" | sha256sum -c - || {
+      report_task "$_tid" failed '{"error":"sha256_mismatch"}'
+      rm -rf "$work"
+      return 1
+    }
+  else
+    report_task "$_tid" failed '{"error":"no_sha256sum"}'
+    rm -rf "$work"
+    return 1
+  fi
+  if ! command -v unzip >/dev/null 2>&1; then
+    report_task "$_tid" failed '{"error":"no_unzip"}'
+    rm -rf "$work"
+    return 1
+  fi
+  unzip -o "$zipf" -d "$work/unz" >/dev/null
+  core="$(find "$work/unz" -type f -name easytier-core | head -n1)"
+  cli="$(find "$work/unz" -type f -name easytier-cli | head -n1)"
+  if [ -z "$core" ] || [ -z "$cli" ]; then
+    report_task "$_tid" failed '{"error":"missing_binaries"}'
+    rm -rf "$work"
+    return 1
+  fi
+  cp "$core" /usr/bin/easytier-core
+  cp "$cli" /usr/bin/easytier-cli
+  chmod 0755 /usr/bin/easytier-core /usr/bin/easytier-cli
+  mkdir -p /etc/easytier
+  # Do not write network_secret in stage0 install task; leave placeholder toml if absent
+  if [ ! -f /etc/easytier/easytier.toml ]; then
+    cat >/etc/easytier/easytier.toml <<'TOML'
+# stage0 placeholder — network_secret not issued yet
+# <PLACEHOLDER>
+instance_name = "stage0-pending"
+TOML
+    chmod 0600 /etc/easytier/easytier.toml
+  fi
+  if [ ! -f /etc/init.d/easytier ]; then
+    cat >/etc/init.d/easytier <<'INIT'
+#!/bin/sh /etc/rc.common
+START=95
+STOP=10
+USE_PROCD=1
+start_service() {
+	if [ ! -f /etc/easytier/easytier.toml ]; then
+		echo "easytier: missing toml" >&2
+		return 1
+	fi
+	if grep -v '^[[:space:]]*#' /etc/easytier/easytier.toml | grep -q '<'; then
+		echo "easytier: placeholder config, refuse start" >&2
+		return 1
+	fi
+	procd_open_instance
+	procd_set_param command /usr/bin/easytier-core -c /etc/easytier/easytier.toml --rpc-portal 127.0.0.1:15888
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+INIT
+    chmod 0755 /etc/init.d/easytier
+  fi
+  # Do not start if placeholders remain (C06 / stage0)
+  report_task "$_tid" success '{"installed":true,"started":false,"version":"'"$version"'"}'
+  rm -rf "$work"
+  log "install_easytier: binaries installed, not started (no secret yet)"
+  return 0
+}
+
+
+
+
+# Ensure EasyTier overlay iface is accepted by OpenWrt fw4 (lan zone + input/forward).
+# Without this, peer/latency can look fine while ICMP/business traffic is dropped.
+# Never fails the parent task — log warn only.
+ensure_easytier_fw4() {
+  if ! command -v uci >/dev/null 2>&1; then
+    log "easytier_fw4: uci absent; skip"
+    return 0
+  fi
+  # Wait briefly for TUN to appear after easytier-core start
+  _dev=""
+  _try=0
+  while [ "$_try" -lt 8 ]; do
+    _dev="$(ip -4 -o addr show 2>/dev/null | awk '/[[:space:]]inet 10\.254\.0\./ {print $2; exit}')"
+    [ -n "$_dev" ] && break
+    for _cand in easytier0 tun0 et0; do
+      if [ -d "/sys/class/net/$_cand" ]; then
+        _dev="$_cand"
+        break
+      fi
+    done
+    [ -n "$_dev" ] && break
+    _try=$((_try + 1))
+    sleep 1
+  done
+  if [ -z "$_dev" ]; then
+    log "easytier_fw4: no overlay iface yet; skip"
+    return 0
+  fi
+  # strip @suffix if any (unlikely)
+  _dev="$(printf '%s' "$_dev" | cut -d@ -f1)"
+
+  _zidx=""
+  _i=0
+  while uci -q get "firewall.@zone[$_i]" >/dev/null 2>&1; do
+    _name="$(uci -q get "firewall.@zone[$_i].name" 2>/dev/null || true)"
+    if [ "$_name" = "lan" ]; then
+      _zidx="$_i"
+      break
+    fi
+    _i=$((_i + 1))
+  done
+  if [ -z "$_zidx" ]; then
+    log "easytier_fw4: no firewall lan zone; warn skip (dev=$_dev)"
+    return 0
+  fi
+
+  _changed=0
+  # already listed?
+  _listed=0
+  _devs="$(uci -q get "firewall.@zone[$_zidx].device" 2>/dev/null || true)"
+  for _d in $_devs; do
+    [ "$_d" = "$_dev" ] && _listed=1 && break
+  done
+  if [ "$_listed" -eq 0 ]; then
+    if uci add_list "firewall.@zone[$_zidx].device=$_dev" 2>/dev/null; then
+      _changed=1
+      log "easytier_fw4: added $_dev to lan zone"
+    else
+      log "easytier_fw4: failed to add $_dev to lan zone"
+    fi
+  fi
+
+  # Named input rule (idempotent recreate)
+  _need_rules=0
+  _cur_in="$(uci -q get firewall.easytier_input.device 2>/dev/null || true)"
+  _cur_fw="$(uci -q get firewall.easytier_forward.device 2>/dev/null || true)"
+  [ "$_cur_in" = "$_dev" ] || _need_rules=1
+  [ "$_cur_fw" = "$_dev" ] || _need_rules=1
+  if [ "$_need_rules" -eq 1 ]; then
+    uci -q delete firewall.easytier_input 2>/dev/null || true
+    uci set firewall.easytier_input=rule
+    uci set firewall.easytier_input.name='Allow-EasyTier-Input'
+    uci set firewall.easytier_input.src='*'
+    uci set firewall.easytier_input.device="$_dev"
+    uci set firewall.easytier_input.direction='in'
+    uci set firewall.easytier_input.proto='all'
+    uci set firewall.easytier_input.target='ACCEPT' || {
+      log "easytier_fw4: failed to set input rule"
+      return 0
+    }
+    uci -q delete firewall.easytier_forward 2>/dev/null || true
+    uci set firewall.easytier_forward=rule
+    uci set firewall.easytier_forward.name='Allow-EasyTier-Forward'
+    uci set firewall.easytier_forward.src='*'
+    uci set firewall.easytier_forward.dest='*'
+    uci set firewall.easytier_forward.device="$_dev"
+    uci set firewall.easytier_forward.proto='all'
+    uci set firewall.easytier_forward.target='ACCEPT' || {
+      log "easytier_fw4: failed to set forward rule"
+      return 0
+    }
+    _changed=1
+    log "easytier_fw4: ensured Allow-EasyTier rules for $_dev"
+  fi
+
+  if [ "$_changed" -eq 0 ]; then
+    log "easytier_fw4: already ok (dev=$_dev)"
+    return 0
+  fi
+  if ! uci commit firewall 2>/dev/null; then
+    log "easytier_fw4: uci commit failed; warn"
+    return 0
+  fi
+  if [ -x /etc/init.d/firewall ]; then
+    /etc/init.d/firewall reload >/dev/null 2>&1 || {
+      log "easytier_fw4: firewall reload failed; warn"
+      return 0
+    }
+  elif command -v fw4 >/dev/null 2>&1; then
+    fw4 reload >/dev/null 2>&1 || log "easytier_fw4: fw4 reload failed; warn"
+  else
+    log "easytier_fw4: no firewall init; rules committed only"
+  fi
+  log "easytier_fw4: applied for $_dev"
+  return 0
+}
+
+
+# Collect EasyTier peer JSON + local vpn ipv4.
+# Prints two lines: peers_json, vpn_ipv4 (may be empty).
+collect_peer_stats_json() {
+  peers='[]'
+  vpn=''
+  if command -v easytier-cli >/dev/null 2>&1; then
+    raw="$(easytier-cli --rpc-portal 127.0.0.1:15888 -o json peer 2>/dev/null || true)"
+    if [ -n "$raw" ] && printf '%s' "$raw" | grep -q '^\s*\['; then
+      # collapse to one line for embedding in heartbeat JSON
+      peers="$(printf '%s' "$raw" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | sed 's/^ //;s/ $//')"
+    fi
+    # ipv4 of Local row
+    if command -v jsonfilter >/dev/null 2>&1 && [ -n "$raw" ]; then
+      i=0
+      while [ "$i" -lt 30 ]; do
+        cost="$(printf '%s' "$raw" | jsonfilter -e "@[$i].cost" 2>/dev/null || true)"
+        [ -n "$cost" ] || break
+        if [ "$cost" = "Local" ]; then
+          vpn="$(printf '%s' "$raw" | jsonfilter -e "@[$i].ipv4" 2>/dev/null || true)"
+          vpn="$(printf '%s' "$vpn" | cut -d/ -f1)"
+          break
+        fi
+        i=$((i + 1))
+      done
+    fi
+  fi
+  # fallback: parse toml ipv4=
+  if [ -z "$vpn" ] && [ -f /etc/easytier/easytier.toml ]; then
+    vpn="$(sed -n 's/^ipv4[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /etc/easytier/easytier.toml | head -n1 | cut -d/ -f1)"
+  fi
+  printf '%s\n%s\n' "$peers" "$vpn"
+}
+
+task_apply_network() {
+  _tid="$1"
+  _params_json="$2"
+  nn=""; ns=""; peer=""; ip4=""; host=""; inst=""; proxy=""
+  if command -v jsonfilter >/dev/null 2>&1; then
+    nn="$(printf '%s' "$_params_json" | jsonfilter -e '@.network_name' 2>/dev/null)"
+    ns="$(printf '%s' "$_params_json" | jsonfilter -e '@.network_secret' 2>/dev/null)"
+    peer="$(printf '%s' "$_params_json" | jsonfilter -e '@.peer_uri' 2>/dev/null)"
+    ip4="$(printf '%s' "$_params_json" | jsonfilter -e '@.ipv4' 2>/dev/null)"
+    host="$(printf '%s' "$_params_json" | jsonfilter -e '@.hostname' 2>/dev/null)"
+    inst="$(printf '%s' "$_params_json" | jsonfilter -e '@.instance_name' 2>/dev/null)"
+    proxy="$(printf '%s' "$_params_json" | jsonfilter -e '@.proxy_cidr' 2>/dev/null)"
+  fi
+  [ -n "$nn" ] || nn="$(json_get "$_params_json" network_name)"
+  [ -n "$ns" ] || ns="$(json_get "$_params_json" network_secret)"
+  [ -n "$peer" ] || peer="$(json_get "$_params_json" peer_uri)"
+  [ -n "$ip4" ] || ip4="$(json_get "$_params_json" ipv4)"
+  [ -n "$host" ] || host="$(json_get "$_params_json" hostname)"
+  [ -n "$inst" ] || inst="$(json_get "$_params_json" instance_name)"
+  [ -n "$proxy" ] || proxy="$(json_get "$_params_json" proxy_cidr)"
+  [ -n "$inst" ] || inst="$host"
+  [ -n "$host" ] || host="node"
+  [ -n "$inst" ] || inst="$host"
+  case "$ip4" in
+    */*) ;;
+    "") ;;
+    *) ip4="${ip4}/24" ;;
+  esac
+  if [ -z "$nn" ] || [ -z "$ns" ] || [ -z "$peer" ] || [ -z "$ip4" ]; then
+    log "apply_network: missing fields"
+    report_task "$_tid" failed '{"error":"missing_fields"}'
+    return 1
+  fi
+  mkdir -p /etc/easytier
+  tmp="/tmp/easytier.apply.$$"
+  {
+    printf 'instance_name = "%s"\n' "$inst"
+    printf 'hostname = "%s"\n' "$host"
+    printf 'dhcp = false\n'
+    printf 'ipv4 = "%s"\n\n' "$ip4"
+    printf 'listeners = [\n    "tcp://0.0.0.0:11010",\n    "udp://0.0.0.0:11010",\n]\n\n'
+    printf '[network_identity]\n'
+    printf 'network_name = "%s"\n' "$nn"
+    printf 'network_secret = "%s"\n\n' "$ns"
+    printf '[[peer]]\nuri = "%s"\n\n' "$peer"
+    if [ -n "$proxy" ]; then
+      printf '[[proxy_network]]\ncidr = "%s"\n\n' "$proxy"
+    fi
+    printf '[flags]\nprivate_mode = true\nenable_encryption = true\nenable_exit_node = false\ndisable_p2p = false\n'
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  mv "$tmp" /etc/easytier/easytier.toml
+  chmod 0600 /etc/easytier/easytier.toml
+  # ensure init exists (same as install)
+  if [ ! -f /etc/init.d/easytier ] && command -v easytier-core >/dev/null 2>&1; then
+    cat >/etc/init.d/easytier <<'INIT'
+#!/bin/sh /etc/rc.common
+START=95
+STOP=10
+USE_PROCD=1
+start_service() {
+	if [ ! -f /etc/easytier/easytier.toml ]; then
+		echo "easytier: missing toml" >&2
+		return 1
+	fi
+	procd_open_instance
+	procd_set_param command /usr/bin/easytier-core -c /etc/easytier/easytier.toml --rpc-portal 127.0.0.1:15888
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+INIT
+    chmod 0755 /etc/init.d/easytier
+  fi
+  restarted=0
+  if [ -x /etc/init.d/easytier ]; then
+    /etc/init.d/easytier enable >/dev/null 2>&1 || true
+    if /etc/init.d/easytier restart; then
+      restarted=1
+    fi
+  fi
+  if [ "$restarted" -eq 0 ]; then
+    killall easytier-core 2>/dev/null || true
+    sleep 1
+    nohup easytier-core -c /etc/easytier/easytier.toml --rpc-portal 127.0.0.1:15888 >/tmp/easytier-agent.log 2>&1 &
+    sleep 2
+    pgrep easytier-core >/dev/null 2>&1 && restarted=1
+  fi
+  sleep 2
+  if pgrep easytier-core >/dev/null 2>&1; then
+    ensure_easytier_fw4 || true
+    report_task "$_tid" success "$(printf '{"applied":true,"ipv4":"%s","hostname":"%s","restarted":true}' "$ip4" "$host")"
+    return 0
+  fi
+  report_task "$_tid" failed '{"error":"easytier_not_running"}'
+  return 1
+}
+
+
+task_restart_easytier() {
+  _tid="$1"
+  log "restart_easytier start"
+  if [ -x /etc/init.d/easytier ]; then
+    if /etc/init.d/easytier restart; then
+      sleep 2
+      st="unknown"
+      /etc/init.d/easytier status >/dev/null 2>&1 && st="running" || st="stopped"
+      if pgrep -x easytier-core >/dev/null 2>&1 || pgrep easytier-core >/dev/null 2>&1; then
+        st="running"
+        ensure_easytier_fw4 || true
+      fi
+      report_task "$_tid" success "{\"restarted\":true,\"status\":\"$st\"}"
+      return 0
+    fi
+    report_task "$_tid" failed '{"error":"init_restart_failed"}'
+    return 1
+  fi
+  if command -v easytier-core >/dev/null 2>&1 && [ -f /etc/easytier/easytier.toml ]; then
+    killall easytier-core 2>/dev/null || true
+    sleep 1
+    nohup easytier-core -c /etc/easytier/easytier.toml --rpc-portal 127.0.0.1:15888 >/tmp/easytier-agent.log 2>&1 &
+    sleep 2
+    if pgrep easytier-core >/dev/null 2>&1; then
+      ensure_easytier_fw4 || true
+      report_task "$_tid" success '{"restarted":true,"status":"running","via":"nohup"}'
+      return 0
+    fi
+    report_task "$_tid" failed '{"error":"manual_start_failed"}'
+    return 1
+  fi
+  report_task "$_tid" failed '{"error":"easytier_not_installed"}'
+  return 1
+}
+
+
+task_apply_site_routes() {
+  # Rewrite [[proxy_network]] blocks in easytier.toml from advertise_cidrs JSON array.
+  # Empty list → remove all proxy_network sections (no site LAN advertise).
+  _tid="$1"
+  _params_json="$2"
+  toml="/etc/easytier/easytier.toml"
+  if [ ! -f "$toml" ]; then
+    log "apply_site_routes: missing toml"
+    report_task "$_tid" failed '{"error":"missing_toml"}'
+    return 1
+  fi
+  if ! command -v easytier-core >/dev/null 2>&1; then
+    report_task "$_tid" failed '{"error":"easytier_not_installed"}'
+    return 1
+  fi
+
+  # Build CIDR list into temp file (one per line)
+  _cidrs_file="$(mktemp 2>/dev/null || echo /tmp/sdwan-cidrs.$$)"
+  : >"$_cidrs_file"
+  if command -v jsonfilter >/dev/null 2>&1; then
+    _i=0
+    while [ "$_i" -lt 32 ]; do
+      _c="$(printf '%s' "$_params_json" | jsonfilter -e "@.advertise_cidrs[$_i]" 2>/dev/null || true)"
+      [ -n "$_c" ] || break
+      # basic shape check
+      case "$_c" in
+        */*) printf '%s\n' "$_c" >>"$_cidrs_file" ;;
+      esac
+      _i=$((_i + 1))
+    done
+  else
+    # crude extract of quoted CIDRs inside advertise_cidrs array
+    printf '%s' "$_params_json" | tr ',' '\n' | sed -n 's/.*"\([0-9][0-9.]*\/[0-9][0-9]*\)".*/\1/p' >>"$_cidrs_file" || true
+  fi
+
+  _n="$(wc -l <"$_cidrs_file" | tr -d ' ')"
+  log "apply_site_routes: cidrs=$_n"
+
+  # Strip existing [[proxy_network]] ... blocks (and blank lines they leave)
+  _tmp="$(mktemp 2>/dev/null || echo /tmp/sdwan-toml.$$)"
+  awk '
+    BEGIN { skip=0 }
+    /^\[\[proxy_network\]\]/ { skip=1; next }
+    skip==1 && /^\[/ { skip=0 }
+    skip==1 && /^[[:space:]]*$/ { next }
+    skip==1 && /^cidr[[:space:]]*=/ { next }
+    skip==1 { next }
+    { print }
+  ' "$toml" >"$_tmp"
+
+  if [ "$_n" -gt 0 ]; then
+    printf '\n' >>"$_tmp"
+    while IFS= read -r _c || [ -n "$_c" ]; do
+      [ -n "$_c" ] || continue
+      printf '[[proxy_network]]\ncidr = "%s"\n\n' "$_c" >>"$_tmp"
+    done <"$_cidrs_file"
+  fi
+  chmod 0600 "$_tmp"
+  mv "$_tmp" "$toml"
+  chmod 0600 "$toml"
+  rm -f "$_cidrs_file"
+
+  restarted=0
+  if [ -x /etc/init.d/easytier ]; then
+    if /etc/init.d/easytier restart; then
+      sleep 2
+      pgrep easytier-core >/dev/null 2>&1 && restarted=1
+    fi
+  fi
+  if [ "$restarted" -eq 0 ]; then
+    killall easytier-core 2>/dev/null || true
+    sleep 1
+    nohup easytier-core -c "$toml" --rpc-portal 127.0.0.1:15888 >/tmp/easytier-agent.log 2>&1 &
+    sleep 2
+    pgrep easytier-core >/dev/null 2>&1 && restarted=1
+  fi
+  ensure_easytier_fw4 || true
+  if [ "$restarted" -eq 1 ] || pgrep easytier-core >/dev/null 2>&1; then
+    report_task "$_tid" success "$(printf '{"applied":true,"advertise_count":%s,"restarted":true}' "${_n:-0}")"
+    return 0
+  fi
+  report_task "$_tid" failed '{"error":"easytier_not_running"}'
+  return 1
+}
+
+task_refresh_status() {
+  _tid="$1"
+  lan="$(detect_lan_ip)"
+  et="absent"
+  if command -v easytier-cli >/dev/null 2>&1 || command -v easytier-core >/dev/null 2>&1; then
+    et="installed"
+  fi
+  if pgrep -x easytier-core >/dev/null 2>&1 || pgrep easytier-core >/dev/null 2>&1; then
+    et="running"
+  fi
+  do_heartbeat || true
+  stats="$(collect_peer_stats_json)"
+  peers_json="$(printf '%s' "$stats" | sed -n '1p')"
+  vpn_ip="$(printf '%s' "$stats" | sed -n '2p')"
+  [ -n "$peers_json" ] || peers_json='[]'
+  report_task "$_tid" success "$(printf '{"easytier":"%s","lan_ip":"%s","vpn_ipv4":"%s","peers":%s,"refreshed":true}' "$et" "$lan" "$vpn_ip" "$peers_json")"
+  return 0
+}
+
+
+task_firmware_upgrade() {
+  # Stage0 skeleton: download to /tmp, optional sha256 check, NEVER sysupgrade.
+  _tid="$1"
+  _params="$2"
+  url="$(printf '%s' "$_params" | jsonfilter -e '@.url' 2>/dev/null)"
+  sha="$(printf '%s' "$_params" | jsonfilter -e '@.sha256' 2>/dev/null)"
+  auto="$(printf '%s' "$_params" | jsonfilter -e '@.auto_sysupgrade' 2>/dev/null)"
+  if [ -z "$url" ]; then
+    report_task "$_tid" failed '{"error":"missing_url"}'
+    return 1
+  fi
+  case "$url" in
+    https://*) ;;
+    *)
+      report_task "$_tid" failed '{"error":"https_required"}'
+      return 1
+      ;;
+  esac
+  # Refuse auto flash even if cloud mis-set
+  if [ "$auto" = "true" ] || [ "$auto" = "1" ]; then
+    log "firmware_upgrade: refusing auto_sysupgrade (stage0 safe)"
+  fi
+  dest="/tmp/sdwan-fw-$$.bin"
+  log "firmware_upgrade: downloading to $dest"
+  if ! curl -fsSL --connect-timeout 20 --max-time 600 -o "$dest" "$url"; then
+    rm -f "$dest"
+    report_task "$_tid" failed '{"error":"download_failed"}'
+    return 1
+  fi
+  sz=$(wc -c < "$dest" 2>/dev/null | tr -d ' ' || echo 0)
+  if [ -z "$sz" ] || [ "$sz" -lt 1024 ]; then
+    rm -f "$dest"
+    report_task "$_tid" failed '{"error":"file_too_small","bytes":'"${sz:-0}"'}'
+    return 1
+  fi
+  got=""
+  if [ -n "$sha" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      got="$(sha256sum "$dest" | awk '{print $1}')"
+      if [ "$got" != "$sha" ]; then
+        rm -f "$dest"
+        report_task "$_tid" failed '{"error":"sha256_mismatch","expected":"'"$sha"'","got":"'"$got"'"}'
+        return 1
+      fi
+    else
+      rm -f "$dest"
+      report_task "$_tid" failed '{"error":"no_sha256sum"}'
+      return 1
+    fi
+  elif command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$dest" | awk '{print $1}')"
+  fi
+  # Keep file briefly for operator inspection; do NOT call sysupgrade
+  report_task "$_tid" success "$(printf '{"downloaded":true,"path":"%s","bytes":%s,"sha256":"%s","sysupgrade":false,"note":"stage0_download_verify_only"}' "$dest" "$sz" "${got:-}")"
+  log "firmware_upgrade: verified; left at $dest (no sysupgrade)"
+  return 0
+}
+
+extract_tasks_loop() {
+  resp="$1"
+  if ! command -v jsonfilter >/dev/null 2>&1; then
+    log "jsonfilter missing; cannot parse tasks reliably"
+    return 1
+  fi
+  # OpenWrt jsonfilter may not support .length — iterate until empty task_id.
+  # Pass through the whole params object (avoids field-by-field rebuild bugs on
+  # iStoreOS/BusyBox when new_password / network_secret / null proxy_cidr appear).
+  i=0
+  while [ "$i" -lt 20 ]; do
+    tid="$(printf '%s' "$resp" | jsonfilter -e "@.tasks[$i].task_id" 2>/dev/null)"
+    [ -n "$tid" ] || break
+    typ="$(printf '%s' "$resp" | jsonfilter -e "@.tasks[$i].type" 2>/dev/null)"
+    pf="$(mktemp 2>/dev/null || echo /tmp/sdwan-params.$$)"
+    printf '%s' "$resp" | jsonfilter -e "@.tasks[$i].params" >"$pf" 2>/dev/null || echo '{}' >"$pf"
+    # jsonfilter may emit "null" for missing params
+    if [ ! -s "$pf" ] || grep -qx 'null' "$pf"; then
+      echo '{}' >"$pf"
+    fi
+    params_blob="$(cat "$pf")"
+    rm -f "$pf"
+    run_one_task "$tid" "$typ" "$params_blob"
+    i=$((i + 1))
+  done
+}
+
+run_one_task() {
+  tid="$1"
+  typ="$2"
+  params="$3"
+  log "task start id=$tid type=$typ"
+  case "$typ" in
+    change_root_password)
+      task_change_root_password "$tid" "$params"
+      ;;
+    install_easytier)
+      task_install_easytier "$tid" "$params"
+      ;;
+    restart_easytier)
+      task_restart_easytier "$tid"
+      ;;
+    refresh_status)
+      task_refresh_status "$tid"
+      ;;
+    apply_network)
+      task_apply_network "$tid" "$params"
+      ;;
+    apply_site_routes)
+      task_apply_site_routes "$tid" "$params"
+      ;;
+    firmware_upgrade)
+      task_firmware_upgrade "$tid" "$params"
+      ;;
+    *)
+      log "unknown task type=$typ"
+      report_task "$tid" failed '{"error":"unknown_type"}'
+      ;;
+  esac
+}
+
+main_loop() {
+  load_conf
+  load_state
+  acquire_lock
+  trap 'release_lock' EXIT INT TERM
+  mkdir -p "$STATE_DIR" "$CONF_DIR"
+  backoff=5
+  last_hb=0
+
+  # If EasyTier already up (upgrade path), ensure fw4 overlay rules
+  if pgrep -x easytier-core >/dev/null 2>&1 || pgrep easytier-core >/dev/null 2>&1; then
+    ensure_easytier_fw4 || true
+  fi
+
+  while true; do
+    if [ -z "$DEVICE_TOKEN" ]; then
+      if do_enroll; then
+        backoff=5
+      else
+        log "enroll backoff=${backoff}s"
+        sleep "$backoff"
+        backoff=$((backoff * 2))
+        [ "$backoff" -gt 300 ] && backoff=300
+        continue
+      fi
+    fi
+
+    now="$(date +%s 2>/dev/null || echo 0)"
+    if [ $((now - last_hb)) -ge "$HEARTBEAT_EVERY" ]; then
+      if do_heartbeat; then
+        last_hb="$now"
+        backoff=5
+      else
+        log "heartbeat failed (mgmt unreachable); leave easytier alone"
+        sleep "$backoff"
+        backoff=$((backoff * 2))
+        [ "$backoff" -gt 300 ] && backoff=300
+        continue
+      fi
+    fi
+
+    desired="$(http_json GET "/v1/devices/me/desired?wait_seconds=${POLL_WAIT}" "" "$DEVICE_TOKEN")"
+    if [ -z "$desired" ]; then
+      log "desired empty/unreachable; leave easytier alone"
+      sleep "$backoff"
+      backoff=$((backoff * 2))
+      [ "$backoff" -gt 300 ] && backoff=300
+      continue
+    fi
+    if echo "$desired" | grep -q '"error"[[:space:]]*:[[:space:]]*"unauthorized"'; then
+      log "token unauthorized; re-enroll"
+      DEVICE_TOKEN=""
+      DEVICE_ID=""
+      continue
+    fi
+    backoff=5
+    if echo "$desired" | grep -q '"task_id"'; then
+      extract_tasks_loop "$desired"
+    fi
+  done
+}
+
+main_loop

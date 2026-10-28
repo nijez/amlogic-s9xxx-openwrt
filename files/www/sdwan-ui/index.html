@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>金维组网 · 本机</title>
+  <style>
+    :root { --bg:#0f1419; --card:#1a2332; --fg:#e7ecf3; --muted:#8b9bb4; --ok:#3dd68c; --warn:#f5a524; --bad:#f31260; --line:#2a3548; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--fg); }
+    main { max-width: 420px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: .85rem; margin-bottom: 20px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    .row { display:flex; justify-content:space-between; align-items:center; gap:12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .row:last-child { border-bottom: none; }
+    .label { color: var(--muted); font-size: .8rem; }
+    .val { font-size: .95rem; text-align:right; word-break: break-all; }
+    .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background: var(--muted); }
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.bad { background: var(--bad); }
+    a.btn { display:block; text-align:center; text-decoration:none; color:var(--fg); background:#243044; border:1px solid var(--line); border-radius:10px; padding:12px; margin-top:8px; }
+    a.btn:hover { border-color:#3d4f6a; }
+    footer { margin-top: 20px; color: var(--muted); font-size: .75rem; line-height:1.4; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1 id="factory" style="display:flex;align-items:center;gap:10px">
+      <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="14" fill="#0c1118"/>
+        <rect x="4" y="4" width="56" height="56" rx="12" fill="none" stroke="#5b9fff" stroke-width="2"/>
+        <path d="M18 44 V20 h8 l6 16 6-16 h8 v24 h-7 V30 l-5.5 14 h-3 L25 30 v14z" fill="#5b9fff"/>
+        <circle cx="48" cy="18" r="4" fill="#3dd68c"/>
+      </svg>
+      <span id="factory_title">金维组网</span>
+    </h1>
+    <p class="sub">本机状态（局域网）· 不含密钥</p>
+
+    <div class="card">
+      <div class="row"><span class="label">工厂名</span><span class="val" id="factory_name">—</span></div>
+      <div class="row"><span class="label">本机 LAN</span><span class="val" id="lan_ip">—</span></div>
+      <div class="row"><span class="label">型号</span><span class="val" id="model">—</span></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <span class="label">云管理</span>
+        <span class="val"><span class="dot" id="cloud_dot"></span><span id="cloud_status">检测中…</span></span>
+      </div>
+      <div class="row">
+        <span class="label">设备登记</span>
+        <span class="val" id="device_status">—</span>
+      </div>
+      <div class="row">
+        <span class="label">组网（EasyTier）</span>
+        <span class="val"><span class="dot" id="et_dot"></span><span id="et_status">—</span></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label" style="margin-bottom:8px">快捷入口</div>
+      <a class="btn" id="mgmt_link" href="https://sdwan.higmcn.com/admin" target="_blank" rel="noopener">云管理后台</a>
+      <a class="btn" href="/cgi-bin/luci/" target="_blank" rel="noopener">OpenWrt LuCI</a>
+      <a class="btn" href="#" id="mon_link" title="阶段0占位">监控入口（占位）</a>
+    </div>
+
+    <footer>
+      金维组网 · 本机状态页。不显示 enrollment token、组网密钥或设备令牌。<br />
+      刷新约每 15 秒；数据来自本机 CGI。日常接管请用云管理后台。
+    </footer>
+  </main>
+  <script>
+    async function refresh() {
+      try {
+        const r = await fetch('/cgi-bin/sdwan-status.sh', { cache: 'no-store' });
+        const j = await r.json();
+        document.getElementById('factory_title').textContent = j.factory_name || '金维组网';
+        document.getElementById('factory_name').textContent = j.factory_name || '—';
+        document.getElementById('lan_ip').textContent = j.lan_ip || '—';
+        document.getElementById('model').textContent = j.model || '—';
+        document.getElementById('device_status').textContent = j.device_enrolled
+          ? ('已登记' + (j.device_id_short ? ' · ' + j.device_id_short : ''))
+          : '未登记／等待 enroll';
+        const cloud = j.cloud_reachable;
+        const cd = document.getElementById('cloud_dot');
+        const cs = document.getElementById('cloud_status');
+        cd.className = 'dot ' + (cloud ? 'ok' : 'bad');
+        cs.textContent = cloud ? '在线' : '不可达';
+        const et = j.easytier || 'absent';
+        const ed = document.getElementById('et_dot');
+        const es = document.getElementById('et_status');
+        if (et === 'running') { ed.className = 'dot ok'; es.textContent = '已开启'; }
+        else if (et === 'installed') { ed.className = 'dot warn'; es.textContent = '已安装未运行'; }
+        else { ed.className = 'dot bad'; es.textContent = '未安装'; }
+        if (j.mgmt_url) document.getElementById('mgmt_link').href = j.mgmt_url.replace(/\/$/, '') + '/admin';
+        const mon = document.getElementById('mon_link');
+        if (j.monitor_url) { mon.href = j.monitor_url; mon.textContent = '监控入口'; }
+        else { mon.href = '#'; mon.textContent = '监控入口（阶段0占位）'; mon.onclick = function(e){ e.preventDefault(); alert('阶段0占位：跨厂 NVR／RTSP 入口将在组网验收后配置。'); }; }
+      } catch (e) {
+        document.getElementById('cloud_status').textContent = '本机 CGI 失败';
+        document.getElementById('cloud_dot').className = 'dot bad';
+      }
+    }
+    refresh();
+    setInterval(refresh, 15000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# 金维 SoftAP 周期调和：开机后定期 reconcile（未 enroll 开热点）
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /bin/sh -c 'while true; do /usr/sbin/jinwei-softap-ctl reconcile; sleep 60; done'
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}

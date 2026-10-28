@@ -1,0 +1,41 @@
+#!/bin/sh
+# 金维组网：设备端简洁页 uhttpd :81（与 LuCI :80 并存）
+# 静态资源应在 FILES 中位于 /www/sdwan-ui/
+
+[ -d /www/sdwan-ui ] || exit 0
+[ -x /etc/init.d/uhttpd ] || exit 0
+
+mkdir -p /etc/sdwan-ui
+if [ ! -f /etc/sdwan-ui/ui.conf ]; then
+	cat > /etc/sdwan-ui/ui.conf <<'CFG'
+FACTORY_NAME="金维组网"
+MGMT_URL="https://sdwan.higmcn.com"
+MONITOR_URL=""
+CFG
+	chmod 644 /etc/sdwan-ui/ui.conf
+fi
+
+# CGI 可执行名兼容
+if [ -f /www/sdwan-ui/cgi-bin/sdwan-status.sh ] && [ ! -e /www/sdwan-ui/cgi-bin/sdwan-status ]; then
+	ln -sf sdwan-status.sh /www/sdwan-ui/cgi-bin/sdwan-status
+fi
+chmod 755 /www/sdwan-ui/cgi-bin/sdwan-status.sh 2>/dev/null || true
+
+if ! uci -q get uhttpd.sdwan_ui >/dev/null 2>&1; then
+	uci -q batch <<'UCI'
+set uhttpd.sdwan_ui=uhttpd
+set uhttpd.sdwan_ui.listen_http='0.0.0.0:81'
+set uhttpd.sdwan_ui.home='/www/sdwan-ui'
+set uhttpd.sdwan_ui.cgi_prefix='/cgi-bin'
+add_list uhttpd.sdwan_ui.interpreter='.sh=/bin/sh'
+set uhttpd.sdwan_ui.index_page='index.html'
+set uhttpd.sdwan_ui.rfc1918_filter='0'
+set uhttpd.sdwan_ui.max_requests='20'
+set uhttpd.sdwan_ui.http_keepalive='20'
+UCI
+	uci commit uhttpd
+fi
+
+/etc/init.d/uhttpd enable 2>/dev/null || true
+
+exit 0

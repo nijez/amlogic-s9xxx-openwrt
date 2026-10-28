@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="robots" content="noindex"/>
+<title>登录 · 金维组网</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml"/>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --card: #ffffff;
+    --fg: #1a2332;
+    --muted: #6b7a90;
+    --line: #e3e8ef;
+    --accent: #2f6fed;
+    --accent-hover: #2458c7;
+    --shadow: 0 8px 30px rgba(26, 35, 50, 0.08);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px 16px;
+  }
+  .wrap { width: min(380px, 100%); }
+  .brand {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 28px; justify-content: center;
+  }
+  .brand img { width: 44px; height: 44px; }
+  .brand h1 { margin: 0; font-size: 1.35rem; font-weight: 650; letter-spacing: 0.02em; }
+  .brand .sub { margin: 2px 0 0; font-size: 0.8rem; color: var(--muted); }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 28px 24px 22px; box-shadow: var(--shadow);
+  }
+  label { display: block; font-size: 0.8rem; color: var(--muted); margin: 0 0 6px; }
+  input[type=text], input[type=password] {
+    width: 100%; padding: 11px 12px; margin-bottom: 14px;
+    border: 1px solid var(--line); border-radius: 10px;
+    font-size: 0.95rem; background: #fafbfc; color: var(--fg);
+  }
+  input:focus { outline: 2px solid rgba(47,111,237,.35); border-color: var(--accent); background: #fff; }
+  button {
+    width: 100%; margin-top: 6px; padding: 12px;
+    border: 0; border-radius: 10px; font-size: 0.95rem; font-weight: 600;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:hover { background: var(--accent-hover); }
+  .hint { margin-top: 16px; font-size: 0.75rem; color: var(--muted); text-align: center; line-height: 1.5; }
+  footer { margin-top: 24px; font-size: 0.72rem; color: var(--muted); text-align: center; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">
+      <img src="logo.svg" alt=""/>
+      <div>
+        <h1>金维组网</h1>
+        <p class="sub">设备本机登录</p>
+      </div>
+    </div>
+    <div class="card">
+      <!-- 阶段0：本页为品牌登录形象参考 / LuCI 覆盖说明页。
+           量产可：① 用本页替换 LuCI 登录；② 或关闭 LuCI，仅保留 :81 状态页。 -->
+      <form method="post" action="/cgi-bin/luci" onsubmit="return true;">
+        <label for="username">用户名</label>
+        <input id="username" name="luci_username" type="text" autocomplete="username" value="root" required/>
+        <label for="password">密码</label>
+        <input id="password" name="luci_password" type="password" autocomplete="current-password" required/>
+        <button type="submit">登 录</button>
+      </form>
+      <p class="hint">登录后请优先打开本机状态页（默认 :81）。<br/>日常组网与设备接管请使用云管理后台。</p>
+    </div>
+    <footer>金维组网 · 阶段0 品牌界面 · 不含第三方厂商宣传文案</footer>
+  </div>
+</body>
+</html>

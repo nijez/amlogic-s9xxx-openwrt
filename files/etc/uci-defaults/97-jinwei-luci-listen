@@ -1,0 +1,18 @@
+#!/bin/sh
+# 金维组网：量产建议 — LuCI 仅监听局域网，不暴露 WAN
+# 默认注释掉「停掉 LuCI」；需要关闭时取消注释末尾 disable。
+
+# uhttpd main（LuCI 默认 80）只绑 br-lan / 旁路由 LAN 地址较难在 uci-defaults 写死 IP。
+# 阶段0 稳妥做法：保持 0.0.0.0:80，靠厂区防火墙；设备状态页走 :81。
+# 阶段1+ 可选：把 listen_http 改成仅虚拟网或仅 LAN。
+
+# 示例（按现场改，勿直接量产启用未知接口名）：
+# uci -q delete uhttpd.main.listen_http
+# uci -q add_list uhttpd.main.listen_http='10.254.0.11:80'
+# uci commit uhttpd
+
+# 量产「完全关掉 LuCI、只留 :81」时取消下面两行：
+# [ -x /etc/init.d/uhttpd ] || exit 0
+# # 不要 disable 整个 uhttpd（:81 sdwan_ui 同进程）；应删 main listen 或拆实例。
+
+exit 0
