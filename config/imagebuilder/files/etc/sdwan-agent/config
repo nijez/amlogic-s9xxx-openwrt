@@ -1,7 +1,7 @@
 # /etc/sdwan-agent/config  (root 可读, 0600)
-# ENROLL_TOKEN: replace __ENROLL_TOKEN__ per device before flashing (see scripts/inject-enroll-token.sh)
+# ENROLL_TOKEN: replace stage0-enroll-If49xrMjqIL7XxF2xKNLz5Y6XpMGabxZseVii2D7KBE per device before flashing (see scripts/inject-enroll-token.sh)
 MGMT_URL="https://sdwan.higmcn.com"
-ENROLL_TOKEN="__ENROLL_TOKEN__"
+ENROLL_TOKEN="stage0-enroll-If49xrMjqIL7XxF2xKNLz5Y6XpMGabxZseVii2D7KBE"
 MACHINE_ID=""
 POLL_WAIT="25"
 HEARTBEAT_EVERY="45"

@@ -293,8 +293,19 @@ task_install_easytier() {
   sha="$(printf '%s' "$_params_json" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   dry="$(printf '%s' "$_params_json" | sed -n 's/.*"dry_run"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -n1)"
   version="$(printf '%s' "$_params_json" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  # Prefer jsonfilter when present (sed is greedy / fragile on nested JSON)
+  if command -v jsonfilter >/dev/null 2>&1; then
+    _ju="$(printf '%s' "$_params_json" | jsonfilter -e '@.url' 2>/dev/null)"
+    _js="$(printf '%s' "$_params_json" | jsonfilter -e '@.sha256' 2>/dev/null)"
+    _jv="$(printf '%s' "$_params_json" | jsonfilter -e '@.version' 2>/dev/null)"
+    _jd="$(printf '%s' "$_params_json" | jsonfilter -e '@.dry_run' 2>/dev/null)"
+    [ -n "$_ju" ] && [ "$_ju" != "null" ] && url="$_ju"
+    [ -n "$_js" ] && [ "$_js" != "null" ] && sha="$_js"
+    [ -n "$_jv" ] && [ "$_jv" != "null" ] && version="$_jv"
+    [ -n "$_jd" ] && [ "$_jd" != "null" ] && dry="$_jd"
+  fi
 
-  log "install_easytier: received version=$version dry_run=$dry"
+  log "install_easytier: received version=$version dry_run=$dry url_host=$(printf '%s' "$url" | sed -n 's#https\?://\([^/]*\).*#\1#p')"
 
   if [ "$dry" = "true" ]; then
     report_task "$_tid" success '{"dry_run":true,"received":true,"version":"'"$version"'"}'
@@ -306,58 +317,19 @@ task_install_easytier() {
     report_task "$_tid" failed '{"error":"unsupported_arch","arch":"'"$arch"'"}'
     return 1
   fi
-  if [ -z "$url" ] || [ -z "$sha" ]; then
-    report_task "$_tid" failed '{"error":"missing_url_or_sha"}'
-    return 1
-  fi
 
-  work="$(mktemp -d 2>/dev/null || echo /tmp/sdwan-et.$$)"
-  mkdir -p "$work"
-  zipf="$work/et.zip"
-  if ! curl -fsSL --retry 3 -m 300 -o "$zipf" "$url"; then
-    report_task "$_tid" failed '{"error":"download_failed"}'
-    rm -rf "$work"
-    return 1
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    echo "$sha  $zipf" | sha256sum -c - || {
-      report_task "$_tid" failed '{"error":"sha256_mismatch"}'
-      rm -rf "$work"
-      return 1
-    }
-  else
-    report_task "$_tid" failed '{"error":"no_sha256sum"}'
-    rm -rf "$work"
-    return 1
-  fi
-  if ! command -v unzip >/dev/null 2>&1; then
-    report_task "$_tid" failed '{"error":"no_unzip"}'
-    rm -rf "$work"
-    return 1
-  fi
-  unzip -o "$zipf" -d "$work/unz" >/dev/null
-  core="$(find "$work/unz" -type f -name easytier-core | head -n1)"
-  cli="$(find "$work/unz" -type f -name easytier-cli | head -n1)"
-  if [ -z "$core" ] || [ -z "$cli" ]; then
-    report_task "$_tid" failed '{"error":"missing_binaries"}'
-    rm -rf "$work"
-    return 1
-  fi
-  cp "$core" /usr/bin/easytier-core
-  cp "$cli" /usr/bin/easytier-cli
-  chmod 0755 /usr/bin/easytier-core /usr/bin/easytier-cli
-  mkdir -p /etc/easytier
-  # Do not write network_secret in stage0 install task; leave placeholder toml if absent
-  if [ ! -f /etc/easytier/easytier.toml ]; then
-    cat >/etc/easytier/easytier.toml <<'TOML'
+  ensure_easytier_init() {
+    mkdir -p /etc/easytier
+    if [ ! -f /etc/easytier/easytier.toml ]; then
+      cat >/etc/easytier/easytier.toml <<'TOML'
 # stage0 placeholder — network_secret not issued yet
 # <PLACEHOLDER>
 instance_name = "stage0-pending"
 TOML
-    chmod 0600 /etc/easytier/easytier.toml
-  fi
-  if [ ! -f /etc/init.d/easytier ]; then
-    cat >/etc/init.d/easytier <<'INIT'
+      chmod 0600 /etc/easytier/easytier.toml
+    fi
+    if [ ! -f /etc/init.d/easytier ]; then
+      cat >/etc/init.d/easytier <<'INIT'
 #!/bin/sh /etc/rc.common
 START=95
 STOP=10
@@ -379,12 +351,87 @@ start_service() {
 	procd_close_instance
 }
 INIT
-    chmod 0755 /etc/init.d/easytier
+      chmod 0755 /etc/init.d/easytier
+    fi
+    /etc/init.d/easytier enable >/dev/null 2>&1 || true
+  }
+
+  # 量产路径：镜像已带二进制则跳过下载（烧完即用）
+  if [ -x /usr/bin/easytier-core ] && [ -x /usr/bin/easytier-cli ]; then
+    ensure_easytier_init
+    report_task "$_tid" success '{"installed":true,"started":false,"version":"'"$version"'","source":"preinstalled"}'
+    log "install_easytier: preinstalled binaries present, skip download"
+    return 0
   fi
+
+  work="$(mktemp -d 2>/dev/null || echo /tmp/sdwan-et.$$)"
+  mkdir -p "$work"
+  zipf=""
+  source="download"
+  # 镜像内缓存 zip（可选）
+  for cand in \
+    "/usr/share/jinwei/easytier-linux-aarch64-${version}.zip" \
+    /usr/share/jinwei/easytier-linux-aarch64-v2.6.4.zip \
+    /usr/share/jinwei/easytier-linux-aarch64.zip
+  do
+    if [ -f "$cand" ]; then
+      zipf="$cand"
+      source="local_zip"
+      log "install_easytier: using local zip $cand"
+      break
+    fi
+  done
+
+  if [ -z "$zipf" ]; then
+    if [ -z "$url" ] || [ -z "$sha" ]; then
+      report_task "$_tid" failed '{"error":"missing_url_or_sha"}'
+      rm -rf "$work"
+      return 1
+    fi
+    zipf="$work/et.zip"
+    # connect-timeout 避免首启瞬时无路由时长时间挂死；记录 curl 退出码便于排障
+    _curl_ec=0
+    if ! curl -fsSL --connect-timeout 20 --retry 3 --retry-delay 2 -m 300 -o "$zipf" "$url"; then
+      _curl_ec=$?
+      # 兜底：若官方 GitHub URL 被下发且失败，不要静默；静态源应已是默认
+      report_task "$_tid" failed '{"error":"download_failed","curl_exit":'"$_curl_ec"',"url_host":"'"$(printf '%s' "$url" | sed -n 's#https\?://\([^/]*\).*#\1#p')"'"}}'
+      rm -rf "$work"
+      return 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+      echo "$sha  $zipf" | sha256sum -c - || {
+        report_task "$_tid" failed '{"error":"sha256_mismatch"}'
+        rm -rf "$work"
+        return 1
+      }
+    else
+      report_task "$_tid" failed '{"error":"no_sha256sum"}'
+      rm -rf "$work"
+      return 1
+    fi
+  fi
+
+  if ! command -v unzip >/dev/null 2>&1; then
+    report_task "$_tid" failed '{"error":"no_unzip"}'
+    rm -rf "$work"
+    return 1
+  fi
+  unzip -o "$zipf" -d "$work/unz" >/dev/null
+  core="$(find "$work/unz" -type f -name easytier-core | head -n1)"
+  cli="$(find "$work/unz" -type f -name easytier-cli | head -n1)"
+  if [ -z "$core" ] || [ -z "$cli" ]; then
+    report_task "$_tid" failed '{"error":"missing_binaries"}'
+    rm -rf "$work"
+    return 1
+  fi
+  cp "$core" /usr/bin/easytier-core
+  cp "$cli" /usr/bin/easytier-cli
+  chmod 0755 /usr/bin/easytier-core /usr/bin/easytier-cli
+  ensure_easytier_init
   # Do not start if placeholders remain (C06 / stage0)
-  report_task "$_tid" success '{"installed":true,"started":false,"version":"'"$version"'"}'
+  report_task "$_tid" success '{"installed":true,"started":false,"version":"'"$version"'","source":"'"$source"'"}'
   rm -rf "$work"
-  log "install_easytier: binaries installed, not started (no secret yet)"
+  log "install_easytier: binaries installed via $source, not started (no secret yet)"
   return 0
 }
 

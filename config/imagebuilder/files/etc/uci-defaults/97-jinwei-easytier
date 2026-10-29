@@ -1,0 +1,14 @@
+#!/bin/sh
+# 量产：预置 EasyTier 二进制后 enable；无真实 toml／仍有占位符时 init 拒绝 start。
+# 入网参数（network_secret／VIP／peer）仍由云端 apply_network 下发。
+[ -x /etc/init.d/easytier ] && /etc/init.d/easytier enable 2>/dev/null || true
+mkdir -p /etc/easytier
+if [ ! -f /etc/easytier/easytier.toml ]; then
+  cat >/etc/easytier/easytier.toml <<'TOML'
+# factory placeholder — await cloud apply_network
+# <PLACEHOLDER>
+instance_name = "jinwei-pending"
+TOML
+  chmod 0600 /etc/easytier/easytier.toml
+fi
+exit 0

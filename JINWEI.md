@@ -40,3 +40,9 @@ gh release download -R nijez/amlogic-s9xxx-openwrt <tag> -p '*s905d*k6.1*.img.gz
 专用「rootfs URL + openwrt_files」workflow 草稿在 factory-sdwan 仓  
 `stage0/firmware/.github-workflow-drafts/build-jinwei-n1-packaging.yml`；  
 推进 `.github/workflows/` 需要带 `workflow` scope 的 token。
+
+## 2026-10-29 EasyTier 量产进镜像
+
+- `usr/bin/easytier-core` / `easytier-cli`（aarch64）已进 `files/` 与 `config/imagebuilder/files/`
+- `etc/init.d/easytier` + `97-jinwei-easytier`
+- enroll：本批试验令牌已注入组装副本（勿把新生产密钥长期留在公开 fork；量产改 Actions secret）
